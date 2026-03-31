@@ -20,8 +20,8 @@ def build_sites_index(sites_set):
     sites_index = {}
     for chromosome, chrom_sites in sites_set.groupby("chromosome", sort=False):
         sites_index[chromosome] = {
-            "forward": chrom_sites.set_index("start")[["epic_id"]],
-            "reverse": chrom_sites.set_index("end")[["epic_id"]],
+            "forward": dict(zip(chrom_sites["start"], chrom_sites["epic_id"])),
+            "reverse": dict(zip(chrom_sites["end"], chrom_sites["epic_id"])),
         }
     return sites_index
 
@@ -41,6 +41,17 @@ def chunk_records(records, chunk_size):
         chunk_size = 1
     for idx in range(0, len(records), chunk_size):
         yield records[idx : idx + chunk_size]
+
+
+def chunk_unique_methylation_alignments(alignments_by_read, chunk_size):
+    chunk = []
+    for read_alignment in iter_unique_methylation_alignments(alignments_by_read):
+        chunk.append(read_alignment)
+        if len(chunk) >= chunk_size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
 
 
 def read_bam_files(path, recursive, file_queue, bams_amount, bam_filter):
@@ -137,16 +148,14 @@ def io_handler(
                         )
                     )
             if reads_seen % read_amount == 0 and alignm:
-                unique_alignments = list(iter_unique_methylation_alignments(alignm))
-                for chunk in chunk_records(unique_alignments, chunk_size):
+                for chunk in chunk_unique_methylation_alignments(alignm, chunk_size):
                     methylation_queue.put(chunk)
                     with methylation_read_number.get_lock():
                         methylation_read_number.value += len(chunk)
                 alignm.clear()
 
         if alignm:
-            unique_alignments = list(iter_unique_methylation_alignments(alignm))
-            for chunk in chunk_records(unique_alignments, chunk_size):
+            for chunk in chunk_unique_methylation_alignments(alignm, chunk_size):
                 methylation_queue.put(chunk)
                 with methylation_read_number.get_lock():
                     methylation_read_number.value += len(chunk)
@@ -155,73 +164,61 @@ def io_handler(
             bams_analysed.value += 1
 
 def process_methylation_data(read_row, sites_index):
-    # create alignment pairs panda df
-    aligned_pairs = pd.DataFrame(read_row[1], columns=["query_pos", "ref_pos"])
     modified_bases = read_row[2]
 
     chrom_sites = sites_index.get(read_row[0])
     if chrom_sites is None:
         return []
 
+    query_to_ref = {}
+    for query_pos, ref_pos in read_row[1]:
+        if query_pos is None or ref_pos is None:
+            continue
+        query_to_ref[query_pos] = ref_pos
+
     if read_row[3] is True:  # if read is reversed
         modified_positions = modified_bases.get(("C", 1, "m"))
         if not modified_positions:
             return []
-        methylation_pos_df = pd.DataFrame(
-            modified_positions,
-            columns=["query_pos", "methylation"],
-        )
-        res = (
-            aligned_pairs.join(methylation_pos_df.set_index("query_pos"), on="query_pos")
-            .dropna()
-            .reset_index(drop=True)
-        )
-        cpgs = chrom_sites["reverse"].join(res.set_index("ref_pos"), how="inner")[
-            ["epic_id", "methylation"]
-        ]
+        epic_lookup = chrom_sites["reverse"]
     else:
         modified_positions = modified_bases.get(("C", 0, "m"))
         if not modified_positions:
             return []
-        methylation_pos_df = pd.DataFrame(
-            modified_positions,
-            columns=["query_pos", "methylation"],
-        )
-        res = (
-            aligned_pairs.join(methylation_pos_df.set_index("query_pos"), on="query_pos")
-            .dropna()
-            .reset_index(drop=True)
-        )
-        cpgs = chrom_sites["forward"].join(res.set_index("ref_pos"), how="inner")[
-            ["epic_id", "methylation"]
-        ]
+        epic_lookup = chrom_sites["forward"]
 
-    if cpgs.empty:
+    cpgs = []
+    for query_pos, methylation_raw in modified_positions:
+        ref_pos = query_to_ref.get(query_pos)
+        if ref_pos is None:
+            continue
+        epic_id = epic_lookup.get(ref_pos)
+        if epic_id is None:
+            continue
+        methylation = methylation_raw / 255
+        cpgs.append([epic_id, methylation, int(methylation >= 0.8)])
+
+    if not cpgs:
         return []
 
-    cpgs["methylation"] = cpgs["methylation"] / 255
-    cpgs["scores_per_read"] = len(cpgs.index)
-    cpgs["binary_methylation"] = (cpgs["methylation"] >= 0.8).astype(int)
-    cpgs["read_id"] = read_row[7]
-    cpgs["start_time"] = read_row[4]
-    cpgs["run_id"] = read_row[5]
-    cpgs["QS"] = read_row[8]
-    cpgs["read_length"] = read_row[9]
-    cpgs["map_qs"] = read_row[10]
-    return cpgs[
-        [
-            "epic_id",
-            "methylation",
-            "scores_per_read",
-            "binary_methylation",
-            "read_id",
-            "start_time",
-            "run_id",
-            "QS",
-            "read_length",
-            "map_qs",
-        ]
-    ].values.tolist()
+    scores_per_read = len(cpgs)
+    rows = []
+    for epic_id, methylation, binary_methylation in cpgs:
+        rows.append(
+            [
+                epic_id,
+                methylation,
+                scores_per_read,
+                binary_methylation,
+                read_row[7],
+                read_row[4],
+                read_row[5],
+                read_row[8],
+                read_row[9],
+                read_row[10],
+            ]
+        )
+    return rows
 
 
 def methylation_reader(
@@ -259,13 +256,29 @@ def methylation_reader(
             result_queue.put(rows)
     result_queue.put(None)
 
+
 def progress(finished,methylation_threads,bams_analysed,bams_amount,methylation_read_number_analysed,methylation_read_number):
     # function to track progress of parallel tasks 
+    started = time.time()
+    last_newline = started
     while True:
         if finished.value >= methylation_threads:
             break
         time.sleep(1)
-        print('\r' + 'Bams: ' + str(bams_analysed.value) + '/' + str(bams_amount.value) + ' Reads: ' + str(methylation_read_number_analysed.value) + '/' + str(methylation_read_number.value), end="")
+        elapsed = max(time.time() - started, 1e-6)
+        analysed = methylation_read_number_analysed.value
+        queued = methylation_read_number.value
+        message = (
+            f"Bams: {bams_analysed.value}/{bams_amount.value} "
+            f"Reads: {analysed}/{queued} "
+            f"Rate: {analysed / elapsed:.1f} reads/s "
+            f"Elapsed: {elapsed:.0f}s"
+        )
+        if time.time() - last_newline >= 30:
+            print(message, flush=True)
+            last_newline = time.time()
+        else:
+            print('\r' + message, end="", flush=True)
 
 
 def main(inputs, recursive, io_threads, methylation_threads, sites, sample, output, bam_filter, read_amount):

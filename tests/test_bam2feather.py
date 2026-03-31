@@ -25,9 +25,9 @@ class Bam2FeatherHelpersTest(unittest.TestCase):
 
         index = MODULE.build_sites_index(sites)
 
-        self.assertEqual(index["chr1"]["forward"].loc[10, "epic_id"], "cg0001")
-        self.assertEqual(index["chr1"]["reverse"].loc[21, "epic_id"], "cg0002")
-        self.assertEqual(index["chr2"]["forward"].loc[30, "epic_id"], "cg0003")
+        self.assertEqual(index["chr1"]["forward"][10], "cg0001")
+        self.assertEqual(index["chr1"]["reverse"][21], "cg0002")
+        self.assertEqual(index["chr2"]["forward"][30], "cg0003")
 
     def test_iter_unique_methylation_alignments_filters_non_unique_and_empty(self):
         alignments = {
@@ -47,6 +47,45 @@ class Bam2FeatherHelpersTest(unittest.TestCase):
     def test_chunk_records_splits_into_fixed_sizes(self):
         chunks = list(MODULE.chunk_records(list(range(7)), 3))
         self.assertEqual(chunks, [[0, 1, 2], [3, 4, 5], [6]])
+
+    def test_chunk_unique_methylation_alignments_streams_unique_reads(self):
+        alignments = {
+            "read1": [("chr1", [], {("C", 0, "m"): [(1, 255)]}, False, "st", "rg", "rn", "read1", 10, 100, 60)],
+            "read2": [("chr1", [], {}, False, "st", "rg", "rn", "read2", 10, 100, 60)],
+            "read3": [("chr1", [], {("C", 0, "m"): [(2, 255)]}, False, "st", "rg", "rn", "read3", 10, 100, 60)],
+        }
+
+        chunks = list(MODULE.chunk_unique_methylation_alignments(alignments, 1))
+
+        self.assertEqual([[chunk[0][7]] for chunk in chunks], [["read1"], ["read3"]])
+
+    def test_process_methylation_data_maps_modified_positions_without_pandas_joins(self):
+        sites_index = {
+            "chr1": {
+                "forward": {101: "cg101"},
+                "reverse": {205: "cg205"},
+            }
+        }
+        read_row = (
+            "chr1",
+            [(1, 101), (2, 102), (3, 103)],
+            {("C", 0, "m"): [(1, 255), (2, 10)]},
+            False,
+            "2026-03-31T19:30:00Z",
+            "runA",
+            "rn",
+            "read1",
+            12,
+            1234,
+            60,
+        )
+
+        rows = MODULE.process_methylation_data(read_row, sites_index)
+
+        self.assertEqual(
+            rows,
+            [["cg101", 1.0, 1, 1, "read1", "2026-03-31T19:30:00Z", "runA", 12, 1234, 60]],
+        )
 
 
 if __name__ == "__main__":
