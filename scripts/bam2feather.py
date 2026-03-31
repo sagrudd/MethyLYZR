@@ -2,6 +2,7 @@
 import argparse
 import os
 import pathlib
+import shutil
 import time
 from collections import defaultdict
 from multiprocessing import Manager, Process, Queue, Value
@@ -257,6 +258,44 @@ def methylation_reader(
     result_queue.put(None)
 
 
+RESULT_COLUMNS = [
+    "epic_id",
+    "methylation",
+    "scores_per_read",
+    "binary_methylation",
+    "read_id",
+    "start_time",
+    "run_id",
+    "QS",
+    "read_length",
+    "map_qs",
+]
+
+
+def write_result_chunks(result_queue, methylation_threads, chunk_dir, chunk_row_target):
+    os.makedirs(chunk_dir, exist_ok=True)
+    pending_rows = []
+    finished_readers = 0
+    chunk_index = 0
+
+    while finished_readers < methylation_threads:
+        result = result_queue.get()
+        if result is None:
+            finished_readers += 1
+            continue
+
+        pending_rows.extend(result)
+        if len(pending_rows) >= chunk_row_target:
+            chunk_path = os.path.join(chunk_dir, f"chunk-{chunk_index:05d}.feather")
+            pd.DataFrame(pending_rows, columns=RESULT_COLUMNS).to_feather(chunk_path)
+            chunk_index += 1
+            pending_rows = []
+
+    if pending_rows:
+        chunk_path = os.path.join(chunk_dir, f"chunk-{chunk_index:05d}.feather")
+        pd.DataFrame(pending_rows, columns=RESULT_COLUMNS).to_feather(chunk_path)
+
+
 def progress(finished,methylation_threads,bams_analysed,bams_amount,methylation_read_number_analysed,methylation_read_number):
     # function to track progress of parallel tasks 
     started = time.time()
@@ -332,6 +371,13 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
         methylation_processes.append(Process(target=methylation_reader, args=(methylation_queue, result_queue, sites_index, finished, methylation_read_number_analysed)))
         methylation_processes[i].start()
 
+    chunk_dir = os.path.join(output, ".bam2feather-chunks")
+    writer_process = Process(
+        target=write_result_chunks,
+        args=(result_queue, methylation_threads, chunk_dir, max(100000, chunk_size * 200)),
+    )
+    writer_process.start()
+
     # track progress of analysis 
     progress_process = Process(target=progress,args=(finished,methylation_threads,bams_analysed,bams_amount,methylation_read_number_analysed,methylation_read_number))
     progress_process.start()
@@ -349,27 +395,21 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
     for j in range(methylation_threads):
         methylation_queue.put(None)
 
-    # waiting for methylataion reader processes to complete
-    methylation_rows = []
-    finished_readers = 0
-    while finished_readers < methylation_threads:
-        result = result_queue.get()
-        if result is None:
-            finished_readers += 1
-        else:
-            methylation_rows.extend(result)
-
     for i in range(methylation_threads):
         methylation_processes[i].join()
 
+    writer_process.join()
     progress_process.join()
 
     # saving methylation data, if any was collected 
     print()
-    if methylation_rows:
+    chunk_paths = sorted(pathlib.Path(chunk_dir).glob("chunk-*.feather"))
+    if chunk_paths:
         print('Saving data to feather.')
-        # creating panda df from methylation list 
-        methylation = pd.DataFrame(methylation_rows, columns=["epic_id", "methylation", "scores_per_read", "binary_methylation", "read_id", "start_time", "run_id","QS","read_length","map_qs"]).sort_values('start_time')
+        methylation = pd.concat(
+            (pd.read_feather(chunk_path) for chunk_path in chunk_paths),
+            ignore_index=True,
+        ).sort_values('start_time')
 
         # for each run, adjust start times based on run-specific metadata 
         methylation_runs = []
@@ -387,6 +427,7 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
             os.makedirs(output)
         # save the methylation data to a Feather file for efficient storage and access
         methylation.sort_values('start_time').reset_index(drop=True).to_feather(output + '/' + sample + '.feather')
+        shutil.rmtree(chunk_dir, ignore_errors=True)
     else:
         print('No data retrieved.')
 

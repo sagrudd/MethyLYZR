@@ -1,4 +1,6 @@
 import importlib.util
+import multiprocessing
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -86,6 +88,24 @@ class Bam2FeatherHelpersTest(unittest.TestCase):
             rows,
             [["cg101", 1.0, 1, 1, "read1", "2026-03-31T19:30:00Z", "runA", 12, 1234, 60]],
         )
+
+    def test_write_result_chunks_flushes_rows_to_feather_files(self):
+        result_queue = multiprocessing.Queue()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [
+                ["cg101", 1.0, 1, 1, "read1", "2026-03-31T19:30:00Z", "runA", 12, 1234, 60],
+                ["cg102", 0.5, 1, 0, "read2", "2026-03-31T19:31:00Z", "runA", 13, 1235, 55],
+            ]
+            result_queue.put(rows[:1])
+            result_queue.put(rows[1:])
+            result_queue.put(None)
+
+            MODULE.write_result_chunks(result_queue, 1, tmpdir, 1)
+
+            chunk_paths = sorted(Path(tmpdir).glob("chunk-*.feather"))
+            self.assertEqual(len(chunk_paths), 2)
+            merged = pd.concat([pd.read_feather(path) for path in chunk_paths], ignore_index=True)
+            self.assertEqual(list(merged["epic_id"]), ["cg101", "cg102"])
 
 
 if __name__ == "__main__":
