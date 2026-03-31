@@ -89,23 +89,57 @@ class Bam2FeatherHelpersTest(unittest.TestCase):
             [["cg101", 1.0, 1, 1, "read1", "2026-03-31T19:30:00Z", "runA", 12, 1234, 60]],
         )
 
-    def test_write_result_chunks_flushes_rows_to_feather_files(self):
-        result_queue = multiprocessing.Queue()
+    def test_write_chunk_file_writes_feather_with_worker_label(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             rows = [
                 ["cg101", 1.0, 1, 1, "read1", "2026-03-31T19:30:00Z", "runA", 12, 1234, 60],
                 ["cg102", 0.5, 1, 0, "read2", "2026-03-31T19:31:00Z", "runA", 13, 1235, 55],
             ]
-            result_queue.put(rows[:1])
-            result_queue.put(rows[1:])
-            result_queue.put(None)
-
-            MODULE.write_result_chunks(result_queue, 1, tmpdir, 1)
-
-            chunk_paths = sorted(Path(tmpdir).glob("chunk-*.feather"))
-            self.assertEqual(len(chunk_paths), 2)
-            merged = pd.concat([pd.read_feather(path) for path in chunk_paths], ignore_index=True)
+            chunk_path = MODULE.write_chunk_file(tmpdir, "worker-00", 0, rows)
+            self.assertTrue(Path(chunk_path).exists())
+            self.assertEqual(Path(chunk_path).name, "worker-00-chunk-00000.feather")
+            merged = pd.read_feather(chunk_path)
             self.assertEqual(list(merged["epic_id"]), ["cg101", "cg102"])
+
+    def test_methylation_reader_flushes_pending_rows_when_sentinel_arrives(self):
+        methylation_queue = multiprocessing.Queue()
+        finished = multiprocessing.Value("i", 0, lock=True)
+        analysed = multiprocessing.Value("i", 0, lock=True)
+        sites_index = {"chr1": {"forward": {101: "cg101"}, "reverse": {}}}
+        read_row = (
+            "chr1",
+            [(1, 101)],
+            {("C", 0, "m"): [(1, 255)]},
+            False,
+            "2026-03-31T19:30:00Z",
+            "runA",
+            "rn",
+            "read1",
+            12,
+            1234,
+            60,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            methylation_queue.put([read_row])
+            methylation_queue.put(None)
+
+            MODULE.methylation_reader(
+                methylation_queue,
+                sites_index,
+                finished,
+                analysed,
+                tmpdir,
+                100,
+                "worker-00",
+            )
+
+            chunk_paths = sorted(Path(tmpdir).glob("*.feather"))
+            self.assertEqual([path.name for path in chunk_paths], ["worker-00-chunk-00000.feather"])
+            written = pd.read_feather(chunk_paths[0])
+            self.assertEqual(list(written["epic_id"]), ["cg101"])
+            self.assertEqual(finished.value, 1)
+            self.assertEqual(analysed.value, 1)
 
 
 if __name__ == "__main__":

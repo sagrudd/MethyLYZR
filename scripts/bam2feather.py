@@ -224,10 +224,12 @@ def process_methylation_data(read_row, sites_index):
 
 def methylation_reader(
     methylation_queue,
-    result_queue,
     sites_index,
     finished,
     methylation_read_number_analysed,
+    chunk_dir,
+    chunk_row_target,
+    worker_label,
 ):
     # function for parsing methylation information from the sequencing data 
 
@@ -238,24 +240,28 @@ def methylation_reader(
     # finished: counter for completion of parallel tasks 
     # methylation_read_number_analysed: counter tracking number of processed reads 
 
+    pending_rows = []
+    chunk_index = 0
+
     while True:
         # get the next chunk of methylation data from queue 
         data = methylation_queue.get()
 
         if data is None:
-            time.sleep(1)
+            if pending_rows:
+                write_chunk_file(chunk_dir, worker_label, chunk_index, pending_rows)
             with finished.get_lock():
                 finished.value += 1
             break
 
-        rows = []
         for read_row in data:
             with methylation_read_number_analysed.get_lock():
                 methylation_read_number_analysed.value += 1
-            rows.extend(process_methylation_data(read_row, sites_index))
-        if rows:
-            result_queue.put(rows)
-    result_queue.put(None)
+            pending_rows.extend(process_methylation_data(read_row, sites_index))
+            if len(pending_rows) >= chunk_row_target:
+                write_chunk_file(chunk_dir, worker_label, chunk_index, pending_rows)
+                chunk_index += 1
+                pending_rows = []
 
 
 RESULT_COLUMNS = [
@@ -272,28 +278,11 @@ RESULT_COLUMNS = [
 ]
 
 
-def write_result_chunks(result_queue, methylation_threads, chunk_dir, chunk_row_target):
+def write_chunk_file(chunk_dir, worker_label, chunk_index, rows):
     os.makedirs(chunk_dir, exist_ok=True)
-    pending_rows = []
-    finished_readers = 0
-    chunk_index = 0
-
-    while finished_readers < methylation_threads:
-        result = result_queue.get()
-        if result is None:
-            finished_readers += 1
-            continue
-
-        pending_rows.extend(result)
-        if len(pending_rows) >= chunk_row_target:
-            chunk_path = os.path.join(chunk_dir, f"chunk-{chunk_index:05d}.feather")
-            pd.DataFrame(pending_rows, columns=RESULT_COLUMNS).to_feather(chunk_path)
-            chunk_index += 1
-            pending_rows = []
-
-    if pending_rows:
-        chunk_path = os.path.join(chunk_dir, f"chunk-{chunk_index:05d}.feather")
-        pd.DataFrame(pending_rows, columns=RESULT_COLUMNS).to_feather(chunk_path)
+    chunk_path = os.path.join(chunk_dir, f"{worker_label}-chunk-{chunk_index:05d}.feather")
+    pd.DataFrame(rows, columns=RESULT_COLUMNS).to_feather(chunk_path)
+    return chunk_path
 
 
 def progress(finished,methylation_threads,bams_analysed,bams_amount,methylation_read_number_analysed,methylation_read_number):
@@ -337,7 +326,6 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
     file_queue = Queue()
     manager = Manager()
     methylation_queue = Queue(100)
-    result_queue = Queue(100)
     finished = Value('i',0,lock=True)
     methylation_read_number = Value('i',0,lock=True)
     methylation_read_number_analysed = Value('i',0,lock=True)
@@ -362,21 +350,29 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
     # initialize and start IO handler for processing of BAM files 
     io_processes = []
     chunk_size = max(1, read_amount // max(1, methylation_threads))
+    chunk_dir = os.path.join(output, ".bam2feather-chunks")
+    chunk_row_target = max(100000, chunk_size * 200)
     for i in range(io_threads):
         io_processes.append(Process(target=io_handler, args=(file_queue, methylation_queue, methylation_read_number, bams_analysed, runs, read_amount, chunk_size)))
         io_processes[i].start()
     # initialize and start methylation reader for processing of methylation data 
     methylation_processes = []
     for i in range(methylation_threads):
-        methylation_processes.append(Process(target=methylation_reader, args=(methylation_queue, result_queue, sites_index, finished, methylation_read_number_analysed)))
+        methylation_processes.append(
+            Process(
+                target=methylation_reader,
+                args=(
+                    methylation_queue,
+                    sites_index,
+                    finished,
+                    methylation_read_number_analysed,
+                    chunk_dir,
+                    chunk_row_target,
+                    f"worker-{i:02d}",
+                ),
+            )
+        )
         methylation_processes[i].start()
-
-    chunk_dir = os.path.join(output, ".bam2feather-chunks")
-    writer_process = Process(
-        target=write_result_chunks,
-        args=(result_queue, methylation_threads, chunk_dir, max(100000, chunk_size * 200)),
-    )
-    writer_process.start()
 
     # track progress of analysis 
     progress_process = Process(target=progress,args=(finished,methylation_threads,bams_analysed,bams_amount,methylation_read_number_analysed,methylation_read_number))
@@ -398,12 +394,11 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
     for i in range(methylation_threads):
         methylation_processes[i].join()
 
-    writer_process.join()
     progress_process.join()
 
     # saving methylation data, if any was collected 
     print()
-    chunk_paths = sorted(pathlib.Path(chunk_dir).glob("chunk-*.feather"))
+    chunk_paths = sorted(pathlib.Path(chunk_dir).glob("*.feather"))
     if chunk_paths:
         print('Saving data to feather.')
         methylation = pd.concat(
