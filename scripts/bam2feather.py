@@ -285,6 +285,27 @@ def write_chunk_file(chunk_dir, worker_label, chunk_index, rows):
     return chunk_path
 
 
+def normalize_run_start_times(methylation, runs):
+    methylation_runs = []
+    for run_id, st in runs.items():
+        run = methylation[methylation['run_id'] == run_id].copy()
+        if run.empty:
+            continue
+
+        t1 = arrow.get(run.sort_values('start_time').iloc[0]['start_time'])
+        tdif = np.floor((t1 - arrow.get(st)).total_seconds() / 3600) * 3600
+        normalized = run['start_time'].apply(
+            lambda a: int((arrow.get(a) - arrow.get(st)).total_seconds() - tdif)
+        )
+        run = run.assign(start_time=normalized.astype('int64'))
+        methylation_runs.append(run)
+
+    if not methylation_runs:
+        return methylation
+
+    return pd.concat(methylation_runs, ignore_index=True)
+
+
 def progress(finished,methylation_threads,bams_analysed,bams_amount,methylation_read_number_analysed,methylation_read_number):
     # function to track progress of parallel tasks 
     started = time.time()
@@ -407,16 +428,7 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
         ).sort_values('start_time')
 
         # for each run, adjust start times based on run-specific metadata 
-        methylation_runs = []
-        for run_id, st in runs.items():
-
-            t1 = arrow.get(methylation[methylation['run_id']==run_id].sort_values('start_time').iloc[0]['start_time'])
-            tdif = np.floor((t1-arrow.get(st)).total_seconds()/3600)*3600
-            run = methylation[methylation['run_id']==run_id]
-            run.loc[:,'start_time'] = run['start_time'].apply(lambda a: int((arrow.get(a)-arrow.get(st)).total_seconds()-tdif))
-            methylation_runs.append(run)
-
-        methylation = pd.concat(methylation_runs)
+        methylation = normalize_run_start_times(methylation, runs)
         # ensure output dir exists 
         if not os.path.exists(output):
             os.makedirs(output)

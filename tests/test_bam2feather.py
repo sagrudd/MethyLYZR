@@ -141,6 +141,30 @@ class Bam2FeatherHelpersTest(unittest.TestCase):
             self.assertEqual(finished.value, 1)
             self.assertEqual(analysed.value, 1)
 
+    def test_normalize_run_start_times_converts_arrow_string_column_to_ints(self):
+        methylation = pd.DataFrame(
+            {
+                "epic_id": ["cg101", "cg102"],
+                "methylation": [1.0, 0.5],
+                "scores_per_read": [1, 1],
+                "binary_methylation": [1, 0],
+                "read_id": ["read1", "read2"],
+                "start_time": ["2026-03-31T20:07:43+00:00", "2026-03-31T20:07:45+00:00"],
+                "run_id": ["runA", "runA"],
+                "QS": [12, 13],
+                "read_length": [1234, 1235],
+                "map_qs": [60, 55],
+            }
+        ).convert_dtypes(dtype_backend="pyarrow")
+
+        normalized = MODULE.normalize_run_start_times(
+            methylation,
+            {"runA": "2026-03-31T20:00:00+00:00"},
+        )
+
+        self.assertEqual(str(normalized["start_time"].dtype), "int64")
+        self.assertEqual(list(normalized["start_time"]), [463, 465])
+
 
 if __name__ == "__main__":
     unittest.main()
