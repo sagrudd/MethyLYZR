@@ -5,8 +5,8 @@ import pathlib
 import time
 from collections import defaultdict
 from multiprocessing import Manager, Process, Queue, Value
-import arrow
 
+import arrow
 import numpy as np
 import pandas as pd
 import pysam
@@ -14,6 +14,33 @@ from natsort import natsorted
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*swapaxes.*")
+
+
+def build_sites_index(sites_set):
+    sites_index = {}
+    for chromosome, chrom_sites in sites_set.groupby("chromosome", sort=False):
+        sites_index[chromosome] = {
+            "forward": chrom_sites.set_index("start")[["epic_id"]],
+            "reverse": chrom_sites.set_index("end")[["epic_id"]],
+        }
+    return sites_index
+
+
+def iter_unique_methylation_alignments(alignments_by_read):
+    for alignments in alignments_by_read.values():
+        if len(alignments) != 1:
+            continue
+        read_alignment = alignments[0]
+        if read_alignment[2] == {}:
+            continue
+        yield read_alignment
+
+
+def chunk_records(records, chunk_size):
+    if chunk_size <= 0:
+        chunk_size = 1
+    for idx in range(0, len(records), chunk_size):
+        yield records[idx : idx + chunk_size]
 
 
 def read_bam_files(path, recursive, file_queue, bams_amount, bam_filter):
@@ -50,7 +77,15 @@ def read_bam_files(path, recursive, file_queue, bams_amount, bam_filter):
         for file in natsorted(d.glob('*.bam')):
             file_queue.put(str(file))
 
-def io_handler(file_queue, methylation_queue, methylation_read_number, bams_analysed, runs):
+def io_handler(
+    file_queue,
+    methylation_queue,
+    methylation_read_number,
+    bams_analysed,
+    runs,
+    read_amount,
+    chunk_size,
+):
     # function for processing of sequencing data from BAM files 
 
     # params: 
@@ -78,10 +113,12 @@ def io_handler(file_queue, methylation_queue, methylation_read_number, bams_anal
         # get run ID and date from first read group in BAM file 
         runs[bam.header.as_dict()['RG'][0]['ID']] = bam.header.as_dict()['RG'][0]['DT']
 
-        # iterating over each alignment in BAM file 
+        # iterating over each alignment in BAM file
+        reads_seen = 0
         for alignment in bam:
+            reads_seen += 1
             # ignoring secondary and supplementary alignments 
-            if not alignment.is_secondary | alignment.is_supplementary:
+            if not alignment.is_secondary and not alignment.is_supplementary:
                 if alignment.mapping_quality >= 10:
                     # collect relevant alignment data 
                     alignm[alignment.qname].append(
@@ -99,28 +136,101 @@ def io_handler(file_queue, methylation_queue, methylation_read_number, bams_anal
                             alignment.mapping_quality
                         )
                     )
+            if reads_seen % read_amount == 0 and alignm:
+                unique_alignments = list(iter_unique_methylation_alignments(alignm))
+                for chunk in chunk_records(unique_alignments, chunk_size):
+                    methylation_queue.put(chunk)
+                    with methylation_read_number.get_lock():
+                        methylation_read_number.value += len(chunk)
+                alignm.clear()
+
         if alignm:
-            # conerting alignment data into panda df 
-            methyl_alignments = pd.concat({k: pd.DataFrame(v) for k, v in alignm.items()})
-            methyl_alignments.index.names = ['read_id', 'num_alignments']
-            methyl_alignments = methyl_alignments[methyl_alignments[2] != {}] # filter for alignments with methylation data 
-
-            # group by read ID and filter for unique alignments 
-            ba = methyl_alignments.reset_index().groupby('read_id')['num_alignments'].nunique()
-            bb = ba[ba == 1]
-            bc = methyl_alignments.loc[bb.index]
-
-            # split the data into chunks for parallel processing 
-            ti = np.array_split(bc, 4)
-            for t in ti:
-                methylation_queue.put(t)
+            unique_alignments = list(iter_unique_methylation_alignments(alignm))
+            for chunk in chunk_records(unique_alignments, chunk_size):
+                methylation_queue.put(chunk)
                 with methylation_read_number.get_lock():
-                    methylation_read_number.value += len(t.index)
+                    methylation_read_number.value += len(chunk)
         bam.close()
         with bams_analysed.get_lock():
             bams_analysed.value += 1
 
-def methylation_reader(methylation_queue, methylation_list, sites_set, finished, methylation_read_number_analysed):
+def process_methylation_data(read_row, sites_index):
+    # create alignment pairs panda df
+    aligned_pairs = pd.DataFrame(read_row[1], columns=["query_pos", "ref_pos"])
+    modified_bases = read_row[2]
+
+    chrom_sites = sites_index.get(read_row[0])
+    if chrom_sites is None:
+        return []
+
+    if read_row[3] is True:  # if read is reversed
+        modified_positions = modified_bases.get(("C", 1, "m"))
+        if not modified_positions:
+            return []
+        methylation_pos_df = pd.DataFrame(
+            modified_positions,
+            columns=["query_pos", "methylation"],
+        )
+        res = (
+            aligned_pairs.join(methylation_pos_df.set_index("query_pos"), on="query_pos")
+            .dropna()
+            .reset_index(drop=True)
+        )
+        cpgs = chrom_sites["reverse"].join(res.set_index("ref_pos"), how="inner")[
+            ["epic_id", "methylation"]
+        ]
+    else:
+        modified_positions = modified_bases.get(("C", 0, "m"))
+        if not modified_positions:
+            return []
+        methylation_pos_df = pd.DataFrame(
+            modified_positions,
+            columns=["query_pos", "methylation"],
+        )
+        res = (
+            aligned_pairs.join(methylation_pos_df.set_index("query_pos"), on="query_pos")
+            .dropna()
+            .reset_index(drop=True)
+        )
+        cpgs = chrom_sites["forward"].join(res.set_index("ref_pos"), how="inner")[
+            ["epic_id", "methylation"]
+        ]
+
+    if cpgs.empty:
+        return []
+
+    cpgs["methylation"] = cpgs["methylation"] / 255
+    cpgs["scores_per_read"] = len(cpgs.index)
+    cpgs["binary_methylation"] = (cpgs["methylation"] >= 0.8).astype(int)
+    cpgs["read_id"] = read_row[7]
+    cpgs["start_time"] = read_row[4]
+    cpgs["run_id"] = read_row[5]
+    cpgs["QS"] = read_row[8]
+    cpgs["read_length"] = read_row[9]
+    cpgs["map_qs"] = read_row[10]
+    return cpgs[
+        [
+            "epic_id",
+            "methylation",
+            "scores_per_read",
+            "binary_methylation",
+            "read_id",
+            "start_time",
+            "run_id",
+            "QS",
+            "read_length",
+            "map_qs",
+        ]
+    ].values.tolist()
+
+
+def methylation_reader(
+    methylation_queue,
+    result_queue,
+    sites_index,
+    finished,
+    methylation_read_number_analysed,
+):
     # function for parsing methylation information from the sequencing data 
 
     # params: 
@@ -140,65 +250,14 @@ def methylation_reader(methylation_queue, methylation_list, sites_set, finished,
                 finished.value += 1
             break
 
-        # iterate over rows in data chunk
-        for idx, read_row in data.iterrows():
+        rows = []
+        for read_row in data:
             with methylation_read_number_analysed.get_lock():
                 methylation_read_number_analysed.value += 1
-
-            # create alignment pairs panda df
-            aligned_pairs = pd.DataFrame(
-                read_row[1], columns=["query_pos", "ref_pos"]
-            )
-            modified_bases = read_row[2]
-
-            # filter annotated CpGs for current chromosome
-            chrom_sites = sites_set[sites_set["chromosome"] == read_row[0]]
-            if read_row[3] is True: # if read is reversed
-                methylation_pos_df = pd.DataFrame(
-                    modified_bases[("C", 1, "m")], # querying for methylated cytosine in context of reverse read
-                    columns=["query_pos", "methylation"],
-                )
-                # join alignment pairs with methylation data and drop missing values 
-                res = (
-                    aligned_pairs.join(methylation_pos_df.set_index("query_pos"), on="query_pos")
-                    .dropna()
-                    .reset_index(drop=True)
-                )
-                # join with CpG annotation 
-                cpgs = chrom_sites.join(res.set_index("ref_pos"), on="end").dropna()[
-                    ["epic_id", "methylation"]
-                ]
-
-            else: # if read is not reversed
-                methylation_pos_df = pd.DataFrame(
-                    modified_bases[("C", 0, "m")], # querying for methylated cytosine in context of forward read
-                    columns=["query_pos", "methylation"],
-                )
-                # join alignment pairs with methylation data and drop missing values 
-                res = (
-                    aligned_pairs.join(methylation_pos_df.set_index("query_pos"), on="query_pos")
-                    .dropna()
-                    .reset_index(drop=True)
-                )
-                # join with CpG annotation 
-                cpgs = chrom_sites.join(res.set_index("ref_pos"), on="start").dropna()[
-                    ["epic_id", "methylation"]
-                ]
-
-            if len(cpgs.index) != 0: # if CpGs are found on the read
-                # normalize methylation values and calculate additional metrics
-                cpgs["methylation"] = cpgs["methylation"] / 255
-                cpgs["scores_per_read"] = [len(cpgs.index)] * len(cpgs.index)
-                cpgs["binary_methylation"] = (cpgs["methylation"] >= 0.8).astype(int)
-                cpgs["read_id"] = [read_row[7]] * len(cpgs.index)
-                cpgs["start_time"] = [read_row[4]] * len(cpgs.index)
-                cpgs["run_id"] = [read_row[5]] * len(cpgs.index)
-                cpgs["QS"] = [read_row[8]] * len(cpgs.index)
-                cpgs["read_length"] = [read_row[9]] * len(cpgs.index)
-                cpgs["map_qs"] = [read_row[10]] * len(cpgs.index)
-                # append each processed CpG site to the shared methylation_list
-                for idx, cpg in cpgs.iterrows():
-                    methylation_list.append(cpg.to_list())
+            rows.extend(process_methylation_data(read_row, sites_index))
+        if rows:
+            result_queue.put(rows)
+    result_queue.put(None)
 
 def progress(finished,methylation_threads,bams_analysed,bams_amount,methylation_read_number_analysed,methylation_read_number):
     # function to track progress of parallel tasks 
@@ -209,7 +268,7 @@ def progress(finished,methylation_threads,bams_analysed,bams_amount,methylation_
         print('\r' + 'Bams: ' + str(bams_analysed.value) + '/' + str(bams_amount.value) + ' Reads: ' + str(methylation_read_number_analysed.value) + '/' + str(methylation_read_number.value), end="")
 
 
-def main(inputs, recursive, io_threads, methylation_threads, sites, sample, output, bam_filter):
+def main(inputs, recursive, io_threads, methylation_threads, sites, sample, output, bam_filter, read_amount):
     # 
 
     # params:
@@ -225,8 +284,8 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
     # initializing variables for multiprocessing 
     file_queue = Queue()
     manager = Manager()
-    methylation_list = manager.list()
     methylation_queue = Queue(100)
+    result_queue = Queue(100)
     finished = Value('i',0,lock=True)
     methylation_read_number = Value('i',0,lock=True)
     methylation_read_number_analysed = Value('i',0,lock=True)
@@ -241,6 +300,7 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
             dtype={"chromosome": str, "start": np.int32, "end": np.int32, "epic_id": str},
     )
     sites_set['end'] = sites_set['end']-1
+    sites_index = build_sites_index(sites_set)
     # starting to process the reading of BAM files and enqueue their paths
     print('Start getting files.')
     bam_process = Process(target=read_bam_files, args=(inputs, recursive, file_queue, bams_amount, bam_filter))
@@ -249,13 +309,14 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
     print()
     # initialize and start IO handler for processing of BAM files 
     io_processes = []
+    chunk_size = max(1, read_amount // max(1, methylation_threads))
     for i in range(io_threads):
-        io_processes.append(Process(target=io_handler, args=(file_queue, methylation_queue, methylation_read_number, bams_analysed, runs)))
+        io_processes.append(Process(target=io_handler, args=(file_queue, methylation_queue, methylation_read_number, bams_analysed, runs, read_amount, chunk_size)))
         io_processes[i].start()
     # initialize and start methylation reader for processing of methylation data 
     methylation_processes = []
     for i in range(methylation_threads):
-        methylation_processes.append(Process(target=methylation_reader, args=(methylation_queue, methylation_list, sites_set, finished, methylation_read_number_analysed)))
+        methylation_processes.append(Process(target=methylation_reader, args=(methylation_queue, result_queue, sites_index, finished, methylation_read_number_analysed)))
         methylation_processes[i].start()
 
     # track progress of analysis 
@@ -276,6 +337,15 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
         methylation_queue.put(None)
 
     # waiting for methylataion reader processes to complete
+    methylation_rows = []
+    finished_readers = 0
+    while finished_readers < methylation_threads:
+        result = result_queue.get()
+        if result is None:
+            finished_readers += 1
+        else:
+            methylation_rows.extend(result)
+
     for i in range(methylation_threads):
         methylation_processes[i].join()
 
@@ -283,10 +353,10 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
 
     # saving methylation data, if any was collected 
     print()
-    if methylation_list:
+    if methylation_rows:
         print('Saving data to feather.')
         # creating panda df from methylation list 
-        methylation = pd.DataFrame(list(methylation_list), columns=["epic_id", "methylation", "scores_per_read", "binary_methylation", "read_id", "start_time", "run_id","QS","read_length","map_qs"]).sort_values('start_time')
+        methylation = pd.DataFrame(methylation_rows, columns=["epic_id", "methylation", "scores_per_read", "binary_methylation", "read_id", "start_time", "run_id","QS","read_length","map_qs"]).sort_values('start_time')
 
         # for each run, adjust start times based on run-specific metadata 
         methylation_runs = []
@@ -318,6 +388,7 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--sample', type=str, required=True, help='Name of the Sample')
     parser.add_argument('-o', '--output', type=str,required=True, help="Path to output foldere.")
     parser.add_argument('--filter', type=str, default=None, help='String that needs to be present in path. Useful for filtering on barcodes.')
+    parser.add_argument('--read_amount', type=int, default=4000, help='Number of reads to process per batch.')
     args = parser.parse_args()
     # executing main function with parsed arguments 
-    main(args.inputs, args.recursive, args.io_threads, args.methylation_threads, args.sites, args.sample, args.output, args.filter)
+    main(args.inputs, args.recursive, args.io_threads, args.methylation_threads, args.sites, args.sample, args.output, args.filter, args.read_amount)
