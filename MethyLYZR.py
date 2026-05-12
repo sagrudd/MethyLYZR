@@ -20,7 +20,32 @@ import os
 POSTERIOR_THRESHOLD = 0.6
 BASECOUNT = 300  # the number of reads we standardize to
 
+ALPHA_KEYS = [1000, 3000, 5000, 7500, 10000, 15000]
+ALPHA_VALS = [2.0, 7.0, 8.0, 9.0, 9.0, 9.0]
+BASECOUNT_A = 684.6
+BASECOUNT_B = 0.0759
+CALIB_T_BASE_DEFAULT = 3.2
+CALIB_N_REF_DEFAULT = 7500
+CALIB_ALPHA_T_DEFAULT = 0.5
+
 ### FUNCTIONS ###
+
+
+def get_adaptive_params(n_cpg):
+    alpha = float(np.interp(n_cpg, ALPHA_KEYS, ALPHA_VALS))
+    basecount = BASECOUNT_A + BASECOUNT_B * n_cpg
+    return alpha, basecount
+
+
+def calibrate_posteriors(class_posteriors, n_cpg, T_base=CALIB_T_BASE_DEFAULT,
+                         N_ref=CALIB_N_REF_DEFAULT, alpha_T=CALIB_ALPHA_T_DEFAULT):
+    temperature = T_base * ((N_ref / max(n_cpg, 1)) ** alpha_T)
+    log_posteriors = np.log(np.maximum(class_posteriors.values, 1e-300))
+    log_scaled = log_posteriors / temperature
+    log_scaled -= log_scaled.max()
+    scaled = np.exp(log_scaled)
+    scaled /= scaled.sum()
+    return pd.Series(scaled, index=class_posteriors.index), temperature
 
 
 def calc_denominator(log_likelihoods, prior):
@@ -37,7 +62,8 @@ def calc_denominator(log_likelihoods, prior):
     return log_denom
 
 
-def predict_from_fingerprint(newX, feature_ids, centroids, W, noise, prior, read_weights):
+def predict_from_fingerprint(newX, feature_ids, centroids, W, noise, prior, read_weights,
+                             relief_alpha=-1.0, basecount=BASECOUNT):
     # function to predict class probabilities for a new methlyation profile
 
     # params:
@@ -74,17 +100,25 @@ def predict_from_fingerprint(newX, feature_ids, centroids, W, noise, prior, read
         W = read_weights[:, None] * W.loc[feature_ids, prior.index].to_numpy() * np.mean(1 / read_weights)
 
     # calculating the likelihoods of all classes C_j, i.e, P(x|C_j)
-    log_likelihoods_weighted = np.sum(P1 * newX[:, None] * np.exp(-W) + P0 * (1 - newX[:, None]) * np.exp(-W), axis=0)  # likelihoods for each class
+    log_likelihoods_weighted = np.sum(
+        P1 * newX[:, None] * np.exp(relief_alpha * W) +
+        P0 * (1 - newX[:, None]) * np.exp(relief_alpha * W),
+        axis=0
+    )  # likelihoods for each class
 
     ## REWEIGHTING + BASECOUNT
     # apply reweighting
     likelihood_mat = np.apply_along_axis(
-        lambda x: np.sum(P1 * newX[:, None] * np.exp(-x)[:, None] + P0 * (1 - newX[:, None]) * np.exp(-x)[:, None], axis=0), 0, W
+        lambda x: np.sum(
+            P1 * newX[:, None] * np.exp(relief_alpha * x)[:, None] +
+            P0 * (1 - newX[:, None]) * np.exp(relief_alpha * x)[:, None],
+            axis=0
+        ), 0, W
     )  # recalculate likelihoods with class-specific weights
     likelihood_mat = likelihood_mat.transpose()
     # apply basecount
-    log_likelihood_mat_weighted = likelihood_mat / np.sum(read_weights) * BASECOUNT  # normalize to basecount
-    log_likelihoods_weighted = log_likelihoods_weighted / np.sum(read_weights) * BASECOUNT  # normalize to basecount
+    log_likelihood_mat_weighted = likelihood_mat / np.sum(read_weights) * basecount  # normalize to basecount
+    log_likelihoods_weighted = log_likelihoods_weighted / np.sum(read_weights) * basecount  # normalize to basecount
 
     log_denominator = np.apply_along_axis(
         lambda x: calc_denominator(log_likelihoods=x, prior=prior), 1, log_likelihood_mat_weighted
@@ -96,7 +130,9 @@ def predict_from_fingerprint(newX, feature_ids, centroids, W, noise, prior, read
     return {"posterior": class_posteriors, "log_likelihoods": log_likelihoods_weighted, "epic_ids": feature_ids, "read_weights": read_weights}
 
 
-def predict_sample(sample_id, sample_dir, centroids, W, class_frequency, min_noise, methylation_lower_bound, methylation_upper_bound):
+def predict_sample(sample_id, sample_dir, centroids, W, class_frequency, min_noise, methylation_lower_bound, methylation_upper_bound,
+                   mode="original", calibrate=False, T_base=CALIB_T_BASE_DEFAULT,
+                   N_ref=CALIB_N_REF_DEFAULT, alpha_T=CALIB_ALPHA_T_DEFAULT):
     # function to load sample data, filter, call prediction for given sequencing time
 
     # params:
@@ -134,12 +170,32 @@ def predict_sample(sample_id, sample_dir, centroids, W, class_frequency, min_noi
     binary_vec = test_sample["methylation"]
     binary_vec = (binary_vec >= 0.5).astype(int)
 
+    n_cpg = len(test_sample)
+    if mode == "optimized":
+        relief_alpha, adaptive_basecount = get_adaptive_params(n_cpg)
+        log(f" - MethyLYZR2026 optimized mode: n_cpg={n_cpg}, alpha={relief_alpha:.2f}, basecount={adaptive_basecount:.1f}")
+    else:
+        relief_alpha = -1.0
+        adaptive_basecount = BASECOUNT
+
     log("Predicting classes...\n")
     # call prediction function to get class probabilities from methylation rates
     prediction_list = predict_from_fingerprint(newX=binary_vec, feature_ids=test_sample["epic_id"], centroids=centroids,
-                                               W=W, noise=noise, prior=class_frequency, read_weights=read_weights)
+                                               W=W, noise=noise, prior=class_frequency, read_weights=read_weights,
+                                               relief_alpha=relief_alpha, basecount=adaptive_basecount)
 
     class_posteriors = prediction_list["posterior"].sort_values(ascending=False)
+
+    if calibrate:
+        class_posteriors, temperature = calibrate_posteriors(
+            class_posteriors, n_cpg,
+            T_base=T_base, N_ref=N_ref, alpha_T=alpha_T
+        )
+        class_posteriors = class_posteriors.sort_values(ascending=False)
+        log(f" - Calibration: n_cpg={n_cpg}, T={temperature:.2f} "
+            f"(T_base={T_base}, N_ref={N_ref}, alpha_T={alpha_T})")
+        log(f" - Top posterior before/after: "
+            f"{prediction_list['posterior'].max():.4f} -> {class_posteriors.iloc[0]:.4f}")
 
     return class_posteriors
 
@@ -151,7 +207,9 @@ def log(message, separator=False):
         print("-------------------------------------------------------\n")
 
 
-def main(input, sample, centroids, weights, priors, output, minNoise, methLowerBound, methUpperBound):
+def main(input, sample, centroids, weights, priors, output, minNoise, methLowerBound, methUpperBound,
+         mode="original", calibrate=False, T_base=CALIB_T_BASE_DEFAULT,
+         N_ref=CALIB_N_REF_DEFAULT, alpha_T=CALIB_ALPHA_T_DEFAULT):
     ### PREPROCESSING ###
 
 #     log("""
@@ -161,7 +219,14 @@ def main(input, sample, centroids, weights, priors, output, minNoise, methLowerB
 # \_)(_/(____) (__) \_)(_/(__/  \____/(__/  (____)(__\_)
 # """, True)
 
-    log("M e t h y L Y Z R", True)
+    if mode == "optimized" and calibrate:
+        log("M e t h y L Y Z R  2 0 2 6  (optimized + calibrated)", True)
+    elif mode == "optimized":
+        log("M e t h y L Y Z R  2 0 2 6  (optimized)", True)
+    elif calibrate:
+        log("M e t h y L Y Z R  (original + calibrated)", True)
+    else:
+        log("M e t h y L Y Z R", True)
 
     # log("Starting prediction process...")
 
@@ -195,6 +260,11 @@ def main(input, sample, centroids, weights, priors, output, minNoise, methLowerB
         min_noise=minNoise,
         methylation_lower_bound=methLowerBound,
         methylation_upper_bound=methUpperBound,
+        mode=mode,
+        calibrate=calibrate,
+        T_base=T_base,
+        N_ref=N_ref,
+        alpha_T=alpha_T,
     )
 
     ##################
@@ -207,7 +277,14 @@ def main(input, sample, centroids, weights, priors, output, minNoise, methLowerB
             os.makedirs(output)
 
     ## write table
-    prediction.reset_index().to_csv(output + "/MethyLYZR_" + sample + ".csv", header=["Class", "Posterior Probability"], index=False)
+    suffix = ""
+    if mode == "optimized" and calibrate:
+        suffix = "_2026cal"
+    elif mode == "optimized":
+        suffix = "_2026"
+    elif calibrate:
+        suffix = "_cal"
+    prediction.reset_index().to_csv(output + "/MethyLYZR" + suffix + "_" + sample + ".csv", header=["Class", "Posterior Probability"], index=False)
 
     ## export barplot
 
@@ -221,7 +298,14 @@ def main(input, sample, centroids, weights, priors, output, minNoise, methLowerB
     plt.ylim(0, 1)
     plt.xlabel("Top 5 classes")
     plt.ylabel("Posterior probability")
-    plt.title(sample)
+    if mode == "optimized" and calibrate:
+        plt.title(f"{sample} (MethyLYZR2026 + calibrated)")
+    elif mode == "optimized":
+        plt.title(f"{sample} (MethyLYZR2026)")
+    elif calibrate:
+        plt.title(f"{sample} (calibrated)")
+    else:
+        plt.title(sample)
     plt.xticks(rotation=45)  # Rotate x-axis labels for better readability
     plt.gca().spines[["right", "top"]].set_visible(False)
     plt.tick_params(axis="both", which="both", bottom=False, left=False)  # labels along the bottom edge are off
@@ -230,7 +314,7 @@ def main(input, sample, centroids, weights, priors, output, minNoise, methLowerB
     plt.axhline(y=0.6, color="black", linestyle="--")
 
     # Save the plot
-    plt.savefig(output + "/MethyLYZR_" + sample + ".pdf", format="pdf", bbox_inches="tight")
+    plt.savefig(output + "/MethyLYZR" + suffix + "_" + sample + ".pdf", format="pdf", bbox_inches="tight")
     plt.show()
 
     ##############
@@ -247,7 +331,18 @@ if __name__ == "__main__":
     parser.add_argument("--minNoise", type=float, default=0.05, help="Minimum noise value added to centroids")
     parser.add_argument("--methLowerBound", type=float, default=0.8, help="Lower bound for calling methylated loci")
     parser.add_argument("--methUpperBound", type=float, default=0.2, help="Upper bound for calling unmethylated loci")
+    parser.add_argument("--mode", type=str, choices=["original", "optimized"], default="original",
+                        help="Prediction mode: 'original' = MethyLYZR v1.0.0 (default), 'optimized' = MethyLYZR2026 adaptive alpha and basecount")
+    parser.add_argument("--calibrate", action="store_true", default=False,
+                        help="Enable adaptive temperature scaling of posterior probabilities")
+    parser.add_argument("--T_base", type=float, default=CALIB_T_BASE_DEFAULT,
+                        help=f"Base temperature for calibration (default: {CALIB_T_BASE_DEFAULT})")
+    parser.add_argument("--N_ref", type=int, default=CALIB_N_REF_DEFAULT,
+                        help=f"Reference CpG count where T = T_base (default: {CALIB_N_REF_DEFAULT})")
+    parser.add_argument("--alpha_T", type=float, default=CALIB_ALPHA_T_DEFAULT,
+                        help=f"Exponent for adaptive temperature (default: {CALIB_ALPHA_T_DEFAULT})")
 
     args = parser.parse_args()
 
-    main(args.input, args.sample, args.centroids, args.weights, args.priors, args.output, args.minNoise, args.methLowerBound, args.methUpperBound)
+    main(args.input, args.sample, args.centroids, args.weights, args.priors, args.output, args.minNoise, args.methLowerBound, args.methUpperBound,
+         mode=args.mode, calibrate=args.calibrate, T_base=args.T_base, N_ref=args.N_ref, alpha_T=args.alpha_T)

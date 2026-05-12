@@ -133,6 +133,12 @@ To classify a given Nanopore sample using the pre-trained Naïve Bayes model for
 python MethyLYZR.py -i sampleX.feather -s sampleX -o results
 ```
 
+The default command runs the original MethyLYZR v1.0.0 scoring behavior. The 2026 calibrated update can be enabled explicitly:
+
+```bash
+python MethyLYZR.py -i sampleX.feather -s sampleX -o results --mode optimized --calibrate
+```
+
 #### Pre-trained Model
 Components making up the trained Naïve Bayes model stored in `model/`:
 - centroids (`betas_mean.feather`)
@@ -157,8 +163,23 @@ This model encompasses 91 CNS + 3 metastasis classes.
 | --minNoise | minimum noise value added to centroids (default: 0.05) |
 | --methLowerBound | lower bound for calling methylated loci (default: 0.8) |
 | --methUpperBound | upper bound for calling unmethylated loci (default: 0.2) |
+| --mode | prediction mode: `original` for MethyLYZR v1.0.0 behavior, or `optimized` for MethyLYZR2026 adaptive RELIEF weighting and basecount (default: `original`) |
+| --calibrate | enable adaptive temperature scaling of posterior probabilities (default: off) |
+| --T_base | base temperature used for calibration (default: 3.2) |
+| --N_ref | reference CpG count where `T = T_base` (default: 7500) |
+| --alpha_T | exponent for CpG-dependent adaptive temperature (default: 0.5) |
 
 
+
+#### MethyLYZR2026 Optimized and Calibrated Mode
+
+MethyLYZR2026 mode keeps the original model files unchanged and adjusts how the existing RELIEF weights and posterior probabilities are used at prediction time.
+
+- `--mode optimized` changes the RELIEF weight transformation from `exp(-W)` to `exp(alpha * W)`, where `alpha` is interpolated from the number of observed CpGs.
+- `--mode optimized` also replaces the fixed `BASECOUNT = 300` normalization with `684.6 + 0.0759 * n_cpg`.
+- `--calibrate` applies post-hoc adaptive temperature scaling: `T(n) = T_base * (N_ref / n_cpg) ** alpha_T`.
+- Calibration preserves the top predicted class, but softens the posterior probabilities. This can make low-coverage predictions less likely to exceed the 0.6 high-certainty threshold.
+- Optimized and calibrated runs use suffixed output filenames such as `MethyLYZR_2026_sampleX.csv`, `MethyLYZR_cal_sampleX.csv`, or `MethyLYZR_2026cal_sampleX.csv`.
 
 
 
