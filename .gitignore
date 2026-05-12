@@ -1,2 +1,9 @@
 # Ignore .DS_Store files
 .DS_Store
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]

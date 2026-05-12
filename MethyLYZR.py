@@ -320,7 +320,7 @@ def main(input, sample, centroids, weights, priors, output, minNoise, methLowerB
     ##############
 
 
-if __name__ == "__main__":
+def cli():
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", "--input", type=str, default=".", required=True, help="Filepath to Feather file")
     parser.add_argument("-s", "--sample", type=str, required=True, help="Name of the Sample")
@@ -346,3 +346,7 @@ if __name__ == "__main__":
 
     main(args.input, args.sample, args.centroids, args.weights, args.priors, args.output, args.minNoise, args.methLowerBound, args.methUpperBound,
          mode=args.mode, calibrate=args.calibrate, T_base=args.T_base, N_ref=args.N_ref, alpha_T=args.alpha_T)
+
+
+if __name__ == "__main__":
+    cli()

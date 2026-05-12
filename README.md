@@ -271,6 +271,28 @@ Follow these steps to replicate the demo:
 
 [This dataset](https://doi.org/10.5281/zenodo.13236096) provides methylation data from ONT (R9 and R10) and PacBio sequencing, stored in **feather format**. These data were generated from brain tumor biopsies and can be used **directly as input** for `MethyLYZR.py`, or filtered by timestamps to **post-hoc simulate shorter sequencing runs**.  
 
+## Python Package Build
+
+MethyLYZR can be built as a source distribution and pure-Python wheel for deployment testing:
+
+```bash
+python -m pip install build
+python -m build
+```
+
+The build writes artifacts to `dist/`:
+
+- `methylyzr-<version>.tar.gz`
+- `methylyzr-<version>-py3-none-any.whl`
+
+Install the wheel into a target environment with:
+
+```bash
+python -m pip install dist/methylyzr-<version>-py3-none-any.whl
+```
+
+The wheel provides the `methylzyr` console command for tumor classification and installs the BAM preprocessing scripts `bam2feather.py` and `live_classifier.py`. The pre-trained model files remain external runtime inputs and should be supplied with `-c`, `-w`, and `-p` when they are not present in the working directory.
+
 ## Intraoperative Workflow Video
 
 [This video](https://doi.org/10.5281/zenodo.13324497) provides a **showcase of the intraoperative setup** with real-time recordings of 10 clinical demonstrator samples processed under **intraoperative clinical conditions** at the Point-of-Care. It demonstrates the time required for:

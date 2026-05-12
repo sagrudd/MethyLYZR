@@ -1,0 +1,11 @@
+include LICENSE
+include README.md
+include requirements.txt
+include data/EPIC_CpGannotation.bed
+include img/fig1b.png
+include model/class_priors.csv
+include scripts/*.py
+recursive-include tests *.py
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store
