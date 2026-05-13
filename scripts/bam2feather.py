@@ -55,6 +55,16 @@ def chunk_unique_methylation_alignments(alignments_by_read, chunk_size):
         yield chunk
 
 
+def discover_bam_files(path, recursive, bam_filter):
+    d = pathlib.Path(path)
+    globber = d.rglob if recursive else d.glob
+    files = []
+    for file in natsorted(globber("*.bam")):
+        if bam_filter is None or bam_filter in str(file):
+            files.append(str(file))
+    return files
+
+
 def read_bam_files(path, recursive, file_queue, bams_amount, bam_filter):
     # function to read BAM files from minimap2 output  
 
@@ -65,29 +75,27 @@ def read_bam_files(path, recursive, file_queue, bams_amount, bam_filter):
     # bams_amount: counter for tracking total number of found BAM files 
     # bam_filter: optional string for filtering on barcodes 
 
-    d = pathlib.Path(path)
-    if recursive:
-        # if no filter provided, queue all BAM files 
-        if bam_filter is None:
-            with bams_amount.get_lock():
-                # use natsorted for natural file sorting and rglob for recursive globbing
-                bams_amount.value = len(natsorted(d.rglob('*.bam')))
-            # queue each file 
-            for file in natsorted(d.rglob('*.bam')):
-                file_queue.put(str(file))
-        # if filter is provided, queue all files that contain the filter string 
-        else:
-            for file in natsorted(d.rglob('*.bam')):
-                if bam_filter in str(file):
-                    file_queue.put(str(file))
-                    with bams_amount.get_lock():
-                        bams_amount.value += 1
-    else:
-        with bams_amount.get_lock():
-            bams_amount.value = len(natsorted(d.glob('*.bam')))
-        # glob instead of rglob for non-recursive search     
-        for file in natsorted(d.glob('*.bam')):
-            file_queue.put(str(file))
+    files = discover_bam_files(path, recursive, bam_filter)
+    with bams_amount.get_lock():
+        bams_amount.value = len(files)
+    for file in files:
+        file_queue.put(file)
+
+
+def ensure_bam_index(bamfile):
+    if not os.path.exists(bamfile + ".bai"):
+        pysam.index(bamfile)
+
+
+def _bam_region_tasks(bamfile, sites_index):
+    ensure_bam_index(bamfile)
+    with pysam.AlignmentFile(bamfile) as bam:
+        references = set(bam.references)
+    regions = [chromosome for chromosome in sites_index if chromosome in references]
+    if not regions:
+        return [(bamfile, None)]
+    return [(bamfile, chromosome) for chromosome in regions]
+
 
 def io_handler(
     file_queue,
@@ -222,6 +230,212 @@ def process_methylation_data(read_row, sites_index):
     return rows
 
 
+def modified_c_positions(modified_bases, is_reverse):
+    if is_reverse:
+        return modified_bases.get(("C", 1, "m")) or []
+    return modified_bases.get(("C", 0, "m")) or []
+
+
+def reference_positions_for_query_positions(alignment, query_positions):
+    if not query_positions or alignment.reference_start is None:
+        return {}
+
+    targets = sorted(set(query_positions))
+    target_index = 0
+    query_pos = 0
+    reference_pos = alignment.reference_start
+    mapped = {}
+
+    for operation, length in alignment.cigartuples or []:
+        if target_index >= len(targets):
+            break
+
+        if operation in (0, 7, 8):
+            query_end = query_pos + length
+            while target_index < len(targets) and targets[target_index] < query_end:
+                target = targets[target_index]
+                if target >= query_pos:
+                    mapped[target] = reference_pos + (target - query_pos)
+                target_index += 1
+            query_pos = query_end
+            reference_pos += length
+        elif operation in (1, 4):
+            query_end = query_pos + length
+            while target_index < len(targets) and targets[target_index] < query_end:
+                target_index += 1
+            query_pos = query_end
+        elif operation in (2, 3):
+            reference_pos += length
+        elif operation in (5, 6):
+            continue
+
+    return mapped
+
+
+def process_alignment_methylation_data(alignment, sites_index):
+    chrom_sites = sites_index.get(alignment.reference_name)
+    if chrom_sites is None:
+        return []
+
+    modified_positions = modified_c_positions(alignment.modified_bases, alignment.is_reverse)
+    if not modified_positions:
+        return []
+
+    epic_lookup = chrom_sites["reverse"] if alignment.is_reverse else chrom_sites["forward"]
+    query_positions = [query_pos for query_pos, _ in modified_positions]
+    query_to_ref = reference_positions_for_query_positions(alignment, query_positions)
+
+    cpgs = []
+    for query_pos, methylation_raw in modified_positions:
+        ref_pos = query_to_ref.get(query_pos)
+        if ref_pos is None:
+            continue
+        epic_id = epic_lookup.get(ref_pos)
+        if epic_id is None:
+            continue
+        methylation = methylation_raw / 255
+        cpgs.append([epic_id, methylation, int(methylation >= 0.8)])
+
+    if not cpgs:
+        return []
+
+    scores_per_read = len(cpgs)
+    start_time = alignment.get_tag("st")
+    run_id = alignment.get_tag("RG")
+    qs = alignment.get_tag("qs")
+    read_length = alignment.infer_read_length()
+    mapping_quality = alignment.mapping_quality
+    return [
+        [
+            epic_id,
+            methylation,
+            scores_per_read,
+            binary_methylation,
+            alignment.qname,
+            start_time,
+            run_id,
+            qs,
+            read_length,
+            mapping_quality,
+        ]
+        for epic_id, methylation, binary_methylation in cpgs
+    ]
+
+
+def iter_primary_methylation_alignments(bam, region=None):
+    source = bam.fetch(region) if region is not None else bam
+    for alignment in source:
+        if alignment.is_secondary or alignment.is_supplementary:
+            continue
+        if alignment.mapping_quality < 10:
+            continue
+        yield alignment
+
+
+def write_pending_rows(chunk_dir, worker_label, chunk_index, pending_rows):
+    if not pending_rows:
+        return chunk_index
+    write_chunk_file(chunk_dir, worker_label, chunk_index, pending_rows)
+    return chunk_index + 1
+
+
+def process_alignment_batch(
+    alignments_by_read,
+    sites_index,
+    pending_rows,
+    chunk_dir,
+    chunk_row_target,
+    worker_label,
+    chunk_index,
+    methylation_read_number,
+    methylation_read_number_analysed,
+):
+    for alignments in alignments_by_read.values():
+        if len(alignments) != 1:
+            continue
+        alignment = alignments[0]
+        if alignment.modified_bases == {}:
+            continue
+        with methylation_read_number.get_lock():
+            methylation_read_number.value += 1
+        rows = process_alignment_methylation_data(alignment, sites_index)
+        with methylation_read_number_analysed.get_lock():
+            methylation_read_number_analysed.value += 1
+        pending_rows.extend(rows)
+        if len(pending_rows) >= chunk_row_target:
+            chunk_index = write_pending_rows(chunk_dir, worker_label, chunk_index, pending_rows)
+            pending_rows = []
+    alignments_by_read.clear()
+    return pending_rows, chunk_index
+
+
+def methylation_task_worker(
+    task_queue,
+    sites_index,
+    finished,
+    methylation_read_number,
+    methylation_read_number_analysed,
+    tasks_analysed,
+    runs,
+    chunk_dir,
+    chunk_row_target,
+    read_amount,
+    worker_label,
+):
+    pending_rows = []
+    chunk_index = 0
+
+    while True:
+        task = task_queue.get()
+        if task is None:
+            chunk_index = write_pending_rows(chunk_dir, worker_label, chunk_index, pending_rows)
+            pending_rows = []
+            with finished.get_lock():
+                finished.value += 1
+            break
+
+        bamfile, region = task
+        with pysam.AlignmentFile(bamfile) as bam:
+            for read_group in bam.header.as_dict().get("RG", []):
+                if "ID" in read_group and "DT" in read_group:
+                    runs[read_group["ID"]] = read_group["DT"]
+
+            alignments_by_read = defaultdict(list)
+            reads_seen = 0
+            read_batch_size = max(1, read_amount)
+            for alignment in iter_primary_methylation_alignments(bam, region):
+                alignments_by_read[alignment.qname].append(alignment)
+                reads_seen += 1
+                if reads_seen % read_batch_size == 0 and alignments_by_read:
+                    pending_rows, chunk_index = process_alignment_batch(
+                        alignments_by_read,
+                        sites_index,
+                        pending_rows,
+                        chunk_dir,
+                        chunk_row_target,
+                        worker_label,
+                        chunk_index,
+                        methylation_read_number,
+                        methylation_read_number_analysed,
+                    )
+
+            if alignments_by_read:
+                pending_rows, chunk_index = process_alignment_batch(
+                    alignments_by_read,
+                    sites_index,
+                    pending_rows,
+                    chunk_dir,
+                    chunk_row_target,
+                    worker_label,
+                    chunk_index,
+                    methylation_read_number,
+                    methylation_read_number_analysed,
+                )
+
+        with tasks_analysed.get_lock():
+            tasks_analysed.value += 1
+
+
 def methylation_reader(
     methylation_queue,
     sites_index,
@@ -306,19 +520,19 @@ def normalize_run_start_times(methylation, runs):
     return pd.concat(methylation_runs, ignore_index=True)
 
 
-def progress(finished,methylation_threads,bams_analysed,bams_amount,methylation_read_number_analysed,methylation_read_number):
+def progress(finished, worker_count, tasks_analysed, tasks_amount, methylation_read_number_analysed, methylation_read_number):
     # function to track progress of parallel tasks 
     started = time.time()
     last_newline = started
     while True:
-        if finished.value >= methylation_threads:
+        if finished.value >= worker_count:
             break
         time.sleep(1)
         elapsed = max(time.time() - started, 1e-6)
         analysed = methylation_read_number_analysed.value
         queued = methylation_read_number.value
         message = (
-            f"Bams: {bams_analysed.value}/{bams_amount.value} "
+            f"Tasks: {tasks_analysed.value}/{tasks_amount.value} "
             f"Reads: {analysed}/{queued} "
             f"Rate: {analysed / elapsed:.1f} reads/s "
             f"Elapsed: {elapsed:.0f}s"
@@ -336,22 +550,21 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
     # params:
     # inputs: directory where BAM files are looked for  
     # recusive: boolean whether searching for files should be recursive
-    # io_threads: number of threads used for io-handling
-    # methylation_threads: number of threads used for methylation data extraction 
+    # io_threads: retained for command-line compatibility
+    # methylation_threads: number of BAM/contig workers used for methylation data extraction
     # sites: BED file with CpG site annotation for sites of interest 
     # sample: sample file name 
     # output: output directory 
     # bam_filter: optional string for filtering on barcodes 
 
     # initializing variables for multiprocessing 
-    file_queue = Queue()
+    task_queue = Queue()
     manager = Manager()
-    methylation_queue = Queue(100)
     finished = Value('i',0,lock=True)
     methylation_read_number = Value('i',0,lock=True)
     methylation_read_number_analysed = Value('i',0,lock=True)
-    bams_amount = Value('i',0,lock=True)
-    bams_analysed = Value('i',0,lock=True)
+    tasks_amount = Value('i',0,lock=True)
+    tasks_analysed = Value('i',0,lock=True)
     runs = manager.dict()
 
     # loading CpG sites of interest with annotion from BED file, convert to panda df 
@@ -364,31 +577,36 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
     sites_index = build_sites_index(sites_set)
     # starting to process the reading of BAM files and enqueue their paths
     print('Start getting files.')
-    bam_process = Process(target=read_bam_files, args=(inputs, recursive, file_queue, bams_amount, bam_filter))
-    bam_process.start()
+    bam_files = discover_bam_files(inputs, recursive, bam_filter)
+    tasks = []
+    for bam_file in bam_files:
+        tasks.extend(_bam_region_tasks(bam_file, sites_index))
+    with tasks_amount.get_lock():
+        tasks_amount.value = len(tasks)
+    for task in tasks:
+        task_queue.put(task)
     print('Start reading files.')
     print()
-    # initialize and start IO handler for processing of BAM files 
-    io_processes = []
     chunk_size = max(1, read_amount // max(1, methylation_threads))
     chunk_dir = os.path.join(output, ".bam2feather-chunks")
     chunk_row_target = max(100000, chunk_size * 200)
-    for i in range(io_threads):
-        io_processes.append(Process(target=io_handler, args=(file_queue, methylation_queue, methylation_read_number, bams_analysed, runs, read_amount, chunk_size)))
-        io_processes[i].start()
-    # initialize and start methylation reader for processing of methylation data 
+    worker_count = max(1, methylation_threads)
     methylation_processes = []
-    for i in range(methylation_threads):
+    for i in range(worker_count):
         methylation_processes.append(
             Process(
-                target=methylation_reader,
+                target=methylation_task_worker,
                 args=(
-                    methylation_queue,
+                    task_queue,
                     sites_index,
                     finished,
+                    methylation_read_number,
                     methylation_read_number_analysed,
+                    tasks_analysed,
+                    runs,
                     chunk_dir,
                     chunk_row_target,
+                    read_amount,
                     f"worker-{i:02d}",
                 ),
             )
@@ -396,23 +614,13 @@ def main(inputs, recursive, io_threads, methylation_threads, sites, sample, outp
         methylation_processes[i].start()
 
     # track progress of analysis 
-    progress_process = Process(target=progress,args=(finished,methylation_threads,bams_analysed,bams_amount,methylation_read_number_analysed,methylation_read_number))
+    progress_process = Process(target=progress,args=(finished,worker_count,tasks_analysed,tasks_amount,methylation_read_number_analysed,methylation_read_number))
     progress_process.start()
 
-    # waiting for BAM processing to complete
-    bam_process.join()
+    for _ in range(worker_count):
+        task_queue.put(None)
 
-    for i in range(io_threads):
-        file_queue.put(None)
-
-    # waiting for IO handling processes to complete
-    for i in range(io_threads):
-        io_processes[i].join()
-
-    for j in range(methylation_threads):
-        methylation_queue.put(None)
-
-    for i in range(methylation_threads):
+    for i in range(worker_count):
         methylation_processes[i].join()
 
     progress_process.join()
@@ -443,8 +651,8 @@ if __name__ == '__main__':
     # command line arguments that scripts accepts 
     parser.add_argument('-i', '--inputs', type=str, default='.', required=True, help='Filepath of BAM files')
     parser.add_argument('-r', '--recursive', default=False, action='store_true', help='Recursively monitor subdirectories')
-    parser.add_argument('--io_threads', type=int, default=2, help='Number of Threads used for io-handling')
-    parser.add_argument('--methylation_threads', default=4, type=int, help='Number of Threads used for methylation data extraction')
+    parser.add_argument('--io_threads', type=int, default=2, help='Retained for command-line compatibility with earlier releases')
+    parser.add_argument('--methylation_threads', default=4, type=int, help='Number of BAM/contig workers used for methylation data extraction')
     parser.add_argument('--sites', type=str, default='.', required=True, help='File with CpG-Sites-Annotation in bed format')
     parser.add_argument('-s', '--sample', type=str, required=True, help='Name of the Sample')
     parser.add_argument('-o', '--output', type=str,required=True, help="Path to output foldere.")

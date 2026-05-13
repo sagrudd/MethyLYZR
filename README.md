@@ -97,8 +97,8 @@ The extraction of methylation values from the BAM files into the required file f
 | -o, --output | output directory (required) |
 | --sites | file with CpG site annotation in BED format (required) |
 | -r, --recursive | recursive monitor subdirectories (default: False, action: store_true) |
-| --io_threads | number of threads used for io-handling (default: 2) |
-| --methylation_threads | number of threads used for methylation data extraction (default: 4) |
+| --io_threads | retained for command-line compatibility with earlier releases |
+| --methylation_threads | number of BAM/contig workers used for methylation extraction (default: 4) |
 | --filter | string (present in the path) for filtering on barcodes |
 
 

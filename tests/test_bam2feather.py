@@ -89,6 +89,44 @@ class Bam2FeatherHelpersTest(unittest.TestCase):
             [["cg101", 1.0, 1, 1, "read1", "2026-03-31T19:30:00Z", "runA", 12, 1234, 60]],
         )
 
+    def test_reference_positions_for_query_positions_uses_cigar_without_full_pair_map(self):
+        class Alignment:
+            reference_start = 100
+            cigartuples = [(4, 2), (0, 5), (1, 2), (0, 3), (2, 4), (0, 2)]
+
+        mapped = MODULE.reference_positions_for_query_positions(Alignment(), [1, 2, 4, 7, 9, 11, 12])
+
+        self.assertEqual(mapped, {2: 100, 4: 102, 9: 105, 11: 107, 12: 112})
+
+    def test_process_alignment_methylation_data_only_maps_modified_positions(self):
+        class Alignment:
+            reference_name = "chr1"
+            reference_start = 100
+            cigartuples = [(0, 10)]
+            modified_bases = {("C", 0, "m"): [(1, 255), (5, 10)]}
+            is_reverse = False
+            qname = "read1"
+            mapping_quality = 60
+
+            def get_tag(self, tag):
+                return {
+                    "st": "2026-03-31T19:30:00Z",
+                    "RG": "runA",
+                    "qs": 12,
+                }[tag]
+
+            def infer_read_length(self):
+                return 1234
+
+        sites_index = {"chr1": {"forward": {101: "cg101"}, "reverse": {}}}
+
+        rows = MODULE.process_alignment_methylation_data(Alignment(), sites_index)
+
+        self.assertEqual(
+            rows,
+            [["cg101", 1.0, 1, 1, "read1", "2026-03-31T19:30:00Z", "runA", 12, 1234, 60]],
+        )
+
     def test_write_chunk_file_writes_feather_with_worker_label(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             rows = [
