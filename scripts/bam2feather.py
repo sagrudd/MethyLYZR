@@ -174,6 +174,8 @@ def io_handler(
 
 def process_methylation_data(read_row, sites_index):
     modified_bases = read_row[2]
+    if not modified_bases:
+        return []
 
     chrom_sites = sites_index.get(read_row[0])
     if chrom_sites is None:
@@ -231,6 +233,8 @@ def process_methylation_data(read_row, sites_index):
 
 
 def modified_c_positions(modified_bases, is_reverse):
+    if not modified_bases:
+        return []
     if is_reverse:
         return modified_bases.get(("C", 1, "m")) or []
     return modified_bases.get(("C", 0, "m")) or []
@@ -354,7 +358,7 @@ def process_alignment_batch(
         if len(alignments) != 1:
             continue
         alignment = alignments[0]
-        if alignment.modified_bases == {}:
+        if not alignment.modified_bases:
             continue
         with methylation_read_number.get_lock():
             methylation_read_number.value += 1
